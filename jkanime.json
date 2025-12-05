@@ -1,10 +1,235 @@
-{
-  "id": "jkanime-official-style",
-  "name": "JKAnime",
-  "version": "1.1.0",
-  "author": "Grok",
-  "description": "JKAnime.net – Anime en español latino con servidores Filemoon, Streamtape, YourUpload, etc.",
-  "type": "streaming",
-  "language": "es",
-  "payload": "/// <reference path=\"../online-streaming-provider.d.ts\" />\n\nclass Provider {\n    base = \"https://jkanime.net\";\n    api = \"https://jkanime-api.chrismichaelps.workers.dev/api/v1\";\n\n    getSettings() {\n        return {\n            episodeServers: [\"filemoon\", \"streamtape\", \"yourupload\", \"mixdrop\", \"mega\"],\n            supportsDub: false,\n        };\n    }\n\n    async search({ query }) {\n        const res = await fetch(`${this.api}/search?q=${encodeURIComponent(query)}&limit=30`);\n        if (!res.ok) return [];\n        const data = await res.json();\n        return data.animes.map(a => ({\n            id: a.slug,\n            title: a.title,\n            image: a.poster,\n            url: `${this.base}/${a.slug}/`,\n            subOrDub: \"sub\"\n        }));\n    }\n\n    async findEpisodes(id) {\n        const res = await fetch(`${this.api}/anime/${id}`);\n        const data = await res.json();\n        if (!data.episodes || data.episodes.length === 0) return [];\n\n        return data.episodes.map(ep => ({\n            id: ep.number.toString(),\n            number: ep.number,\n            title: `Episodio ${ep.number}`,\n            url: `${this.base}/${id}/${ep.number}/`\n        }));\n    }\n\n    async findEpisodeServer(episode, serverName = \"filemoon\") {\n        // Extraemos slug del anime y número de episodio de la url\n        const match = episode.url.match(/\\/([\\w-]+\\/)(\\d+)\\/$/);\n        if (!match) throw new Error(\"URL de episodio no válida\");\n        const animeSlug = match[1].slice(0, -1);\n        const epNum = match[2];\n\n        const res = await fetch(`${this.api}/servers?anime=${animeSlug}&episode=${epNum}`);\n        const data = await res.json();\n        if (!data.servers) return { videoSources: [] };\n\n        // Buscamos el servidor que queremos (prioridad: filemoon → streamtape → yourupload → etc.)\n        const priority = [\"filemoon\", \"streamtape\", \"yourupload\", \"mixdrop\", \"mega\"];\n        let chosen = null;\n        for (const srv of priority) {\n            chosen = data.servers.find(s => s.server.toLowerCase() === srv);\n            if (chosen) break;\n        }\n        if (!chosen) chosen = data.servers[0]; // fallback al primero que haya\n\n        const videoUrl = chosen.video || chosen.embed || chosen.code;\n\n        return {\n            server: chosen.server.toLowerCase(),\n            headers: {\n                \"Referer\": \"https://jkanime.net/\",\n                \"Origin\": \"https://jkanime.net\"\n            },\n            videoSources: [{\n                url: videoUrl,\n                type: \"mp4\",\n                quality: \"auto\",\n                isM3U8: videoUrl.includes(\".m3u8\")\n            }]\n        };\n    }\n}\n"
+/// <reference path="../online-streaming-provider.d.ts" />
+/**
+ * Provider para JKanime (usa Mp4upload como servidor preferido)
+ * Autor: D'lessandro + ChatGPT (adaptado estilo AnimeFLV)
+ */
+
+class Provider {
+    base = "https://jkanime.net";
+
+    getSettings(): Settings {
+        return {
+            // mp4upload -> id corto "mp4" o "mp4u". Puedes ajustar.
+            episodeServers: ["mp4upload"],
+            supportsDub: false,
+        };
+    }
+
+    /**
+     * Busca en JKanime
+     */
+    async search(query: SearchOptions): Promise<SearchResult[]> {
+        try {
+            const q = encodeURIComponent(query.query.trim().replace(/\s+/g, "+"));
+            const res = await fetch(`${this.base}/buscar/${q}`);
+            if (!res.ok) return [];
+            const html = await res.text();
+
+            // Buscamos bloques que apunten a /anime/<slug>
+            // Esto captura href y título (por texto del enlace o alt/title)
+            const results: SearchResult[] = [];
+            const anchorRegex = /<a[^>]+href=["'](\/anime\/([^"']+)\/?)["'][^>]*>([\s\S]*?)<\/a>/gi;
+            let m;
+            const seen = new Set<string>();
+            while ((m = anchorRegex.exec(html)) !== null) {
+                const href = m[1];
+                const slug = m[2];
+                if (seen.has(slug)) continue;
+                seen.add(slug);
+
+                // Intentamos obtener título y poster desde el innerHTML capturado
+                const inner = m[3];
+                // title puede venir en <h3>, alt=, title=
+                let title = "";
+                const h3 = inner.match(/<h3[^>]*>([^<]+)<\/h3>/i);
+                if (h3) title = h3[1].trim();
+                if (!title) {
+                    const altMatch = inner.match(/alt=["']([^"']+)["']/i);
+                    if (altMatch) title = altMatch[1].trim();
+                }
+                if (!title) {
+                    // fallback: texto plano dentro del enlace
+                    const text = inner.replace(/<[^>]+>/g, "").trim();
+                    title = text.split("\n").map(s=>s.trim()).find(Boolean) || slug;
+                }
+
+                results.push({
+                    id: slug,
+                    title,
+                    url: `${this.base}/anime/${slug}`,
+                    subOrDub: "sub"
+                });
+
+                if (results.length >= 50) break; // seguridad
+            }
+            return results;
+        } catch (err) {
+            return [];
+        }
+    }
+
+    /**
+     * Encuentra episodios listados en la página del anime.
+     * Busca enlaces tipo /ver/<slug>-<num> o /ver/<slug>-<num>/
+     */
+    async findEpisodes(id: string): Promise<EpisodeDetails[]> {
+        try {
+            const res = await fetch(`${this.base}/anime/${id}`);
+            if (!res.ok) return [];
+            const html = await res.text();
+
+            // Buscamos enlaces a ver/<slug>-<num>
+            const epRegex = /\/ver\/([a-z0-9\-\_]+)-(\d+)(?:\/|")/gi;
+            const episodes: Record<number, EpisodeDetails> = {};
+            let m;
+            while ((m = epRegex.exec(html)) !== null) {
+                const slug = m[1];
+                const num = parseInt(m[2], 10);
+                if (!Number.isFinite(num)) continue;
+                const epId = `${num}`;
+                if (episodes[num]) continue;
+                episodes[num] = {
+                    id: epId,
+                    number: num,
+                    url: `${this.base}/ver/${slug}-${num}`,
+                    title: `Capítulo ${num}`
+                };
+            }
+
+            // Ordenar por número ascendente y devolver array
+            return Object.keys(episodes)
+                .map(n => parseInt(n, 10))
+                .sort((a,b) => a - b)
+                .map(n => episodes[n]);
+        } catch (err) {
+            return [];
+        }
+    }
+
+    /**
+     * Para un episodio concreto, encuentra servidor mp4upload y obtiene el mp4 final.
+     * _server parameter se ignora (usar mp4upload)
+     */
+    async findEpisodeServer(episode: EpisodeDetails, _server: string): Promise<EpisodeServer> {
+        // Headers base (similar al provider animeflv)
+        const headers = {
+            "Accept": "*/*",
+            "Accept-Encoding": "identity;q=1, *;q=0",
+            "Accept-Language": "es-ES,es;q=0.9",
+            "Connection": "keep-alive",
+            "Range": "bytes=0-",
+            "Referer": this.base + "/",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
+        };
+
+        // 1) Obtener la página del episodio y buscar iframe con mp4upload
+        const epRes = await fetch(episode.url);
+        if (!epRes.ok) throw new Error("No se pudo obtener la página del episodio.");
+        const epHtml = await epRes.text();
+
+        // Buscamos iframes que apunten a mp4upload
+        const iframeRegex = /<iframe[^>]+src=["']([^"']*mp4upload[^"']*)["'][^>]*>/i;
+        let match = epHtml.match(iframeRegex);
+        let iframeUrl: string | null = null;
+        if (match) {
+            iframeUrl = match[1];
+            // enlaces relativos asegurar https
+            if (iframeUrl.startsWith("//")) iframeUrl = "https:" + iframeUrl;
+            if (iframeUrl.startsWith("/")) iframeUrl = "https://jkanime.net" + iframeUrl;
+        } else {
+            // Alternativa: lista playlist (jk usa enlaces /playlist/...) buscaremos esos links también
+            const playlistMatch = epHtml.match(/href=["'](\/playlist\/[^"']+)["'][^>]*>Reproducir/);
+            if (playlistMatch) {
+                iframeUrl = this.base + playlistMatch[1];
+            }
+        }
+
+        if (!iframeUrl) throw new Error("No se encontró iframe de mp4upload en la página del episodio.");
+
+        // 2) Si obtuvimos una página /playlist/... navegamos a ella para localizar el iframe real
+        if (iframeUrl.includes("/playlist/")) {
+            const pRes = await fetch(iframeUrl);
+            if (!pRes.ok) throw new Error("No se pudo abrir playlist.");
+            const pHtml = await pRes.text();
+            const iframeMatch2 = pHtml.match(/<iframe[^>]+src=["']([^"']*mp4upload[^"']*)["'][^>]*>/i);
+            if (iframeMatch2) {
+                iframeUrl = iframeMatch2[1].startsWith("//") ? "https:" + iframeMatch2[1] : iframeMatch2[1];
+            }
+        }
+
+        // 3) Abrimos la página del iframe (mp4upload embed page)
+        const iframeRes = await fetch(iframeUrl, { headers });
+        if (!iframeRes.ok) throw new Error("No se pudo abrir iframe de mp4upload.");
+        const iframeHtml = await iframeRes.text();
+
+        // 4) Intentos de extracción del .mp4 (variantes comunes)
+        // a) <source src="...mp4">
+        let videoMatch = iframeHtml.match(/<source[^>]+src=["']([^"']+\.mp4[^"']*)["']/i);
+        // b) file: "....mp4"
+        if (!videoMatch) videoMatch = iframeHtml.match(/file\s*[:=]\s*["']([^"']+\.mp4[^"']*)["']/i);
+        // c) sources: [{file:"...mp4",label:"..."}]
+        if (!videoMatch) {
+            const sourcesMatch = iframeHtml.match(/sources\s*:\s*(\[[^\]]+\])/i);
+            if (sourcesMatch) {
+                try {
+                    const arr = JSON.parse(sourcesMatch[1].replace(/(['"])?([a-z0-9A-Z_]+)(['"])?:/g, '"$2":'));
+                    if (Array.isArray(arr) && arr.length) {
+                        const first = arr[0];
+                        if (first && first.file) {
+                            videoMatch = [null, first.file];
+                        }
+                    }
+                } catch (e) {
+                    // ignore parse error
+                }
+            }
+        }
+        // d) fallback: buscar cualquier .mp4 en el HTML
+        if (!videoMatch) {
+            const anyMp4 = iframeHtml.match(/https?:\/\/[^"'\s>]+\.mp4[^"'\s>]*?/i);
+            if (anyMp4) videoMatch = anyMp4;
+        }
+
+        if (!videoMatch || !videoMatch[1]) {
+            // A veces mp4upload responde con JS que genera la URL (requiere ejecutar JS). Intentamos extraer token/params y construir el embed->api
+            // Intentamos detectar ruta embed-xxxxx.html y consultar con referencia
+            const embedIdMatch = iframeUrl.match(/embed-?([A-Za-z0-9]+)\.html?/i);
+            if (embedIdMatch) {
+                const embedId = embedIdMatch[1];
+                // mp4upload sometimes serves video via https://www.mp4upload.com/embed-{ID}.html which if fetched may contain direct mp4 or further js.
+                // We'll attempt to fetch embed page already done; if no mp4 found, throw descriptive error
+            }
+            throw new Error("No se pudo extraer la URL .mp4 desde la página de Mp4upload. Puede requerir ejecución de JavaScript.");
+        }
+
+        let videoUrl = videoMatch[1];
+
+        // 5) Asegurar que sea URL absoluta
+        if (videoUrl.startsWith("//")) videoUrl = "https:" + videoUrl;
+        if (videoUrl.startsWith("/")) {
+            // relative to mp4upload domain
+            const domainMatch = iframeUrl.match(/https?:\/\/[^\/]+/i);
+            if (domainMatch) videoUrl = domainMatch[0] + videoUrl;
+        }
+
+        // 6) Intenta seguir redirecciones (HEAD) para obtener URL final si el entorno lo permite
+        try {
+            const finalReq = await fetch(videoUrl, { method: "GET", redirect: "manual", headers });
+            const location = finalReq.headers.get("location");
+            if (location) videoUrl = location;
+        } catch (e) {
+            // Ignorar, usamos videoUrl como está
+        }
+
+        return {
+            server: "mp4upload",
+            headers,
+            videoSources: [{
+                url: videoUrl,
+                type: "mp4",
+                quality: "unknown",
+                subtitles: [],
+            }],
+        };
+    }
 }
